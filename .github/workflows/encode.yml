@@ -1,8 +1,7 @@
 # .github/workflows/encode.yml
 # AV1 视频压缩 — Phase 2: 并行编码
-# 串行化：同一时刻只有一个视频在编码
-# compress 完成后立即触发 finalize.yml 并释放锁
-# → 下一个视频的 compress 可以跟当前视频的 finalize 并行
+# 无 concurrency：不会取消任何 run，多视频自然共享 40 runner 池
+# 35 段 + finalize 1 = 36 < 40，finalize 永远有空闲 runner
 name: AV1 Encode
 
 on:
@@ -33,19 +32,13 @@ permissions:
   contents: read
   actions: write
 
-# 只串行化 compress：A 的 compress 完成后释放锁
-# B 的 compress 立即开始，跟 A 的 finalize 并行（1+35=36 < 40）
-concurrency:
-  group: av1-encode
-  cancel-in-progress: false
-
 jobs:
   compress:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         segment: ${{ fromJSON(inputs.segments) }}
-      max-parallel: 40
+      max-parallel: 35
       fail-fast: false
     steps:
       - name: Install ffmpeg
