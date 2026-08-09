@@ -1,0 +1,179 @@
+# .github/workflows/compress.yml
+# AV1 视频压缩 — 三阶段并行架构
+# prepare(切分) → compress(并行编码) → finalize(合并+上传)
+#
+# 隐私保护：
+# - workflow inputs 不含文件名，只传 chat_id/message_id
+# - 所有日志不输出文件名/大小/时长
+# - artifact 自动清理 (retention-days: 1)
+# - 编码后清除元数据 (-map_metadata -1)
+# - 所有中间文件在 /tmp，runner 销毁后自动清除
+name: AV1 Video Compression
+
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: "Telegram chat ID"
+        required: true
+      message_id:
+        description: "Telegram message ID"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Phase 1: 下载 + 切分 ───────────────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      segments: ${{ steps.split.outputs.segments }}
+      count: ${{ steps.split.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python deps
+        run: pip install -r bot/requirements.txt
+
+      - name: Install ffmpeg
+        run: |
+          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | tar xJ -C /tmp
+          echo "/tmp/ffmpeg-master-latest-linux64-gpl/bin" >> $GITHUB_PATH
+
+      - name: Download & split
+        id: split
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python bot/prepare.py "${{ inputs.chat_id }}" "${{ inputs.message_id }}"
+
+      - name: Upload segments
+        uses: actions/upload-artifact@v4
+        with:
+          name: segments
+          path: segments/
+          retention-days: 1
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: metadata
+          path: segments.json
+          retention-days: 1
+
+      - name: Cleanup workspace
+        run: rm -rf segments segments.json
+
+  # ── Phase 2: 并行编码 ──────────────────────────────
+  compress:
+    needs: prepare
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        segment: ${{ fromJSON(needs.prepare.outputs.segments) }}
+      max-parallel: 20
+      fail-fast: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ffmpeg
+        run: |
+          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | tar xJ -C /tmp
+          echo "/tmp/ffmpeg-master-latest-linux64-gpl/bin" >> $GITHUB_PATH
+
+      - name: Download segments
+        uses: actions/download-artifact@v4
+        with:
+          name: segments
+
+      - name: Encode
+        run: |
+          SEG_FILE=$(printf "seg_%03d.mp4" ${{ matrix.segment }})
+          OUT_FILE=$(printf "seg_%03d_enc.mp4" ${{ matrix.segment }})
+
+          ffmpeg -y -i "$SEG_FILE" \
+            -c:v libsvtav1 -preset 2 -crf 36 -pix_fmt yuv420p \
+            -vf "scale=1280:720,setsar=1" \
+            -c:a libopus -b:a 96k \
+            -map_metadata -1 \
+            "$OUT_FILE"
+
+          # 清除原始分片
+          rm -f "$SEG_FILE"
+
+      - name: Upload encoded segment
+        uses: actions/upload-artifact@v4
+        with:
+          name: encoded-${{ matrix.segment }}
+          path: seg_*_enc.mp4
+          retention-days: 1
+
+  # ── Phase 3: 合并 + 上传 ───────────────────────────
+  finalize:
+    needs: [prepare, compress]
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python deps
+        run: pip install -r bot/requirements.txt
+
+      - name: Install ffmpeg
+        run: |
+          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | tar xJ -C /tmp
+          echo "/tmp/ffmpeg-master-latest-linux64-gpl/bin" >> $GITHUB_PATH
+
+      - name: Download metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: metadata
+
+      - name: Download all encoded segments
+        uses: actions/download-artifact@v4
+        with:
+          pattern: encoded-*
+          path: encoded
+          merge-multiple: true
+
+      - name: Merge & upload
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python bot/finalize.py "${{ inputs.chat_id }}" "${{ inputs.message_id }}"
+
+      - name: Delete all artifacts
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+            for (const artifact of artifacts.data.artifacts) {
+              if (artifact.name.startsWith('segments') || 
+                  artifact.name.startsWith('encoded-') || 
+                  artifact.name.startsWith('metadata')) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id
+                });
+                core.info(`Deleted artifact: ${artifact.name}`);
+              }
+            }
