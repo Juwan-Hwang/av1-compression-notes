@@ -36,7 +36,6 @@ jobs:
   # ── Phase 1: 下载 + 切分 ───────────────────────────
   prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     outputs:
       segments: ${{ steps.split.outputs.segments }}
       count: ${{ steps.split.outputs.count }}
@@ -84,7 +83,6 @@ jobs:
   # ── Phase 2: 并行编码 ──────────────────────────────
   compress:
     needs: prepare
-    timeout-minutes: 30
     strategy:
       matrix:
         segment: ${{ fromJSON(needs.prepare.outputs.segments) }}
@@ -127,7 +125,6 @@ jobs:
   # ── Phase 3: 合并 + 上传 ───────────────────────────
   finalize:
     needs: [prepare, compress]
-    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
