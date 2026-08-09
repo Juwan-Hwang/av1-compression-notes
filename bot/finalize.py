@@ -45,14 +45,44 @@ async def main():
                     f.write(f"file 'seg_{i:03d}.mp4'\n")
 
             out_path = os.path.join(tmp, "output.mp4")
-            subprocess.run([
+            # 尝试 concat demuxer (stream copy, 最快)
+            r = subprocess.run([
                 "ffmpeg", "-y",
+                "-fflags", "+genpts",
                 "-f", "concat", "-safe", "0", "-i", list_path,
                 "-c", "copy",
                 "-map_metadata", "-1",
                 "-movflags", "+faststart",
                 out_path
-            ], check=True, capture_output=True)
+            ], capture_output=True, text=True)
+
+            if r.returncode != 0:
+                log.warning(f"concat demuxer failed (exit {r.returncode}), falling back to concat filter")
+                log.warning(f"stderr: {r.stderr[:500]}")
+                # 备用：concat filter (重新编码合并，更可靠但更慢)
+                inputs = []
+                for i in range(len(encoded_files)):
+                    inputs += ["-i", os.path.join(enc_dir, f"seg_{i:03d}.mp4")]
+                filter_parts = []
+                for i in range(len(encoded_files)):
+                    filter_parts.append(f"[{i}:v:0][{i}:a:0]")
+                filter_str = "".join(filter_parts) + f"concat=n={len(encoded_files)}:v=1:a=1[v][a]"
+
+                r2 = subprocess.run([
+                    "ffmpeg", "-y",
+                    *inputs,
+                    "-filter_complex", filter_str,
+                    "-map", "[v]", "-map", "[a]",
+                    "-c:v", "libsvtav1", "-preset", "8", "-crf", "36",
+                    "-c:a", "libopus", "-b:a", "96k",
+                    "-map_metadata", "-1",
+                    "-movflags", "+faststart",
+                    out_path
+                ], capture_output=True, text=True)
+
+                if r2.returncode != 0:
+                    log.error(f"concat filter also failed: {r2.stderr[:500]}")
+                    raise subprocess.CalledProcessError(r2.returncode, r2.args, r2.stdout, r2.stderr)
 
             # 获取视频元数据
             probe = subprocess.run(

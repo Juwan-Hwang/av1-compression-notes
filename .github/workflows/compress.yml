@@ -30,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   # ── Phase 1: 下载 + 切分 ───────────────────────────
