@@ -73,6 +73,52 @@ export default {
       return new Response(`TinyAV1Bot ✅${warning}`, { status: 200 });
     }
 
+    // ── 调试端点：检查 secrets 并测试 GA dispatch ──
+    if (url.pathname === "/debug") {
+      const info = {
+        GH_TOKEN_len: env.GH_TOKEN ? env.GH_TOKEN.length : 0,
+        GH_TOKEN_ends_with_newline: env.GH_TOKEN ? /\n$/.test(env.GH_TOKEN) : "n/a",
+        GH_REPO: env.GH_REPO ? env.GH_REPO.trim() : "(not set)",
+        GH_REPO_len: env.GH_REPO ? env.GH_REPO.length : 0,
+        GH_WORKFLOW: env.GH_WORKFLOW ? env.GH_WORKFLOW.trim() : "(not set)",
+        GH_WORKFLOW_len: env.GH_WORKFLOW ? env.GH_WORKFLOW.length : 0,
+        BOT_TOKEN_len: env.BOT_TOKEN ? env.BOT_TOKEN.length : 0,
+        ADMIN_ID: env.ADMIN_ID ? env.ADMIN_ID.trim() : "(not set)",
+      };
+
+      // 测试 dispatch
+      try {
+        const resp = await fetch(
+          `https://api.github.com/repos/${env.GH_REPO.trim()}/actions/workflows/${env.GH_WORKFLOW.trim()}/dispatches`,
+          {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${env.GH_TOKEN.trim()}`,
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "TinyAV1Bot-Worker",
+            },
+            body: JSON.stringify({
+              ref: "main",
+              inputs: { chat_id: "0", message_id: "0", caption: "", gen_thumbnail: "0" },
+            }),
+          }
+        );
+        info.dispatch_status = resp.status;
+        if (!resp.ok) {
+          const body = await resp.text();
+          info.dispatch_error = body.slice(0, 500);
+        }
+      } catch (e) {
+        info.dispatch_error = e.message;
+      }
+
+      return new Response(JSON.stringify(info, null, 2), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     // ── Webhook 入口 ──
     if (url.pathname === "/webhook" && request.method === "POST") {
       try {
@@ -769,6 +815,7 @@ async function triggerWorkflow(env, chatId, messageId, caption, genThumb) {
         "Authorization": `Bearer ${env.GH_TOKEN}`,
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "TinyAV1Bot-Worker",
       },
       body: JSON.stringify({
         ref: "main",
