@@ -14,7 +14,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-MAX_SEG = 20      # 固定切 20 段，打满 GA 并发
+MAX_SEG = 40      # 切最多 40 段，打满账号级并发上限
 MIN_SEG_SEC = 5    # 每段最少 5 秒，短于此则减少段数
 
 
