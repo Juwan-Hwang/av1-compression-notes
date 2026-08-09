@@ -5,7 +5,9 @@
 自动对齐到最近的关键帧，无损无绿屏。简单可靠。"""
 
 import os, json, subprocess, tempfile, asyncio, logging, shutil
+from functools import wraps
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("av1")
@@ -18,6 +20,26 @@ MAX_SEG = 35      # 切最多 35 段，留 5 个 runner 给 finalize + 下个视
 MIN_SEG_SEC = 5    # 每段最少 5 秒，短于此则减少段数
 
 
+def flood_retry(max_retries=5):
+    """自动处理 Telegram FloodWait，睡对应秒数后重试。"""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except FloodWait as e:
+                    if attempt == max_retries:
+                        log.error(f"FloodWait exceeded {max_retries} retries, giving up")
+                        raise
+                    wait = e.value + 5  # 多等 5 秒余量
+                    log.warning(f"FloodWait: {e.value}s (attempt {attempt}/{max_retries}), sleeping {wait}s...")
+                    await asyncio.sleep(wait)
+        return wrapper
+    return decorator
+
+
+@flood_retry()
 async def main():
     chat_id = int(os.environ["CHAT_ID"])
     message_id = int(os.environ["MESSAGE_ID"])
