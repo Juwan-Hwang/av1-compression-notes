@@ -78,7 +78,7 @@ jobs:
           CAPTION: ${{ inputs.caption }}
         run: python bot/finalize.py
 
-      - name: Delete all artifacts (prepare + encode runs)
+      - name: Delete artifacts (prepare + encode runs)
         if: always()
         uses: actions/github-script@v7
         with:
@@ -86,9 +86,11 @@ jobs:
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
+            // listWorkflowRunArtifacts 才真正按 run_id 过滤
+            // listArtifactsForRepo 的 run_id 参数会被静默忽略，会列出全仓库 artifact
             for (const runId of ['${{ inputs.prepare_run_id }}', '${{ inputs.encode_run_id }}']) {
-              const resp = await github.rest.actions.listArtifactsForRepo({
-                owner, repo, run_id: runId, per_page: 100
+              const resp = await github.rest.actions.listWorkflowRunArtifacts({
+                owner, repo, run_id: Number(runId), per_page: 100
               });
               for (const a of resp.data.artifacts) {
                 await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: a.id });
