@@ -32,6 +32,12 @@ permissions:
   contents: read
   actions: write
 
+# 串行化：一个视频独占全部 40 runner，finalize 零排队立即执行
+# 40 段已打满并发上限，多视频同时跑只会互相抢资源、全部变慢
+concurrency:
+  group: av1-compress
+  cancel-in-progress: false
+
 jobs:
   # ── Phase 1: 下载 + 切分 ───────────────────────────
   prepare:
