@@ -23,6 +23,10 @@ on:
         description: "Original caption (#tags etc) to preserve"
         required: false
         default: ""
+      gen_thumbnail:
+        description: "Generate thumbnail (1/0)"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -157,6 +161,7 @@ jobs:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GEN_THUMBNAIL: ${{ inputs.gen_thumbnail }}
         run: python bot/finalize.py "${{ inputs.chat_id }}" "${{ inputs.message_id }}" "${{ inputs.caption }}"
 
       - name: Delete all artifacts
