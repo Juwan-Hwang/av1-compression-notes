@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 3: 合并所有已编码段，生成缩略图，上传到 Telegram。"""
 
-import os, sys, json, subprocess, tempfile, asyncio, logging, shutil, glob
+import os, json, subprocess, tempfile, asyncio, logging, shutil, glob
 from pyrogram import Client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -13,9 +13,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 
 async def main():
-    chat_id = int(sys.argv[1])
-    message_id = int(sys.argv[2])
-    caption = sys.argv[3] if len(sys.argv) > 3 else ""
+    chat_id = int(os.environ["CHAT_ID"])
+    message_id = int(os.environ["MESSAGE_ID"])
+    caption = os.environ.get("CAPTION", "")
     gen_thumb = os.environ.get("GEN_THUMBNAIL", "0") == "1"
 
     app = Client("av1-finalize", api_id=API_ID, api_hash=API_HASH,

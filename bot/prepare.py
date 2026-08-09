@@ -4,7 +4,7 @@
 原理：ffmpeg -f segment -c copy 按指定时间间隔切分，
 自动对齐到最近的关键帧，无损无绿屏。简单可靠。"""
 
-import os, sys, json, subprocess, tempfile, asyncio, logging, shutil
+import os, json, subprocess, tempfile, asyncio, logging, shutil
 from pyrogram import Client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -19,8 +19,8 @@ MIN_SEG_SEC = 5    # 每段最少 5 秒，短于此则减少段数
 
 
 async def main():
-    chat_id = int(sys.argv[1])
-    message_id = int(sys.argv[2])
+    chat_id = int(os.environ["CHAT_ID"])
+    message_id = int(os.environ["MESSAGE_ID"])
 
     app = Client("av1", api_id=API_ID, api_hash=API_HASH,
                  bot_token=BOT_TOKEN, workdir="/tmp")
