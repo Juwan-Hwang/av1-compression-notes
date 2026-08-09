@@ -1,3 +1,9 @@
 name = "av1-compression-bot"
 main = "worker.js"
 compatibility_date = "2024-01-01"
+
+# KV 命名空间（权限系统 + 用户设置）
+# 用 `wrangler kv:namespace create SETTINGS` 创建，把返回的 id 填到下面
+[[kv_namespaces]]
+binding = "SETTINGS"
+id = "your-kv-namespace-id-here"

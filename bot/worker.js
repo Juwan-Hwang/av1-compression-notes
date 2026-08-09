@@ -1,6 +1,6 @@
 /**
  * Cloudflare Worker — TinyAV1Bot
- * 功能齐全的 AV1 视频压缩 Bot
+ * 带权限管理的 AV1 视频压缩 Bot
  *
  * 命令：
  * /start     欢迎语
@@ -10,6 +10,13 @@
  * /status    Bot 健康检查
  * /dice      骰子娱乐
  * /poll      功能投票
+ * /admin     管理面板（仅管理员）
+ *
+ * 权限系统：
+ * - 管理员 (env.ADMIN_ID): 全部权限，审批申请，管理白名单/封禁列表
+ * - 白名单用户: 可以压缩视频
+ * - 新用户: 发视频会提示写申请（仅一次），管理员主动 /admin 查看
+ * - 封禁用户: 无法使用 Bot，无法提交申请
  *
  * 设置项（KV 持久化，每用户独立）：
  * - keep_caption:    保留 #标签文字 (默认关)
@@ -17,6 +24,20 @@
  * - forward_source:  转发者名字加 #tag (默认关)
  * - source_format:   源格式返回 (默认关)
  * - gen_thumbnail:   自动生成缩略图 (默认关)
+ *
+ * KV 结构：
+ * - whitelist       → JSON array of user IDs (numbers)
+ * - banned          → JSON array of banned user IDs (numbers)
+ * - app:<userId>    → { name, username, text, time, chatId } 申请信息
+ * - u:<chatId>      → 用户设置 JSON
+ *
+ * 安全措施：
+ * ✅ ADMIN_ID 从环境变量读取，不硬编码
+ * ✅ 所有管理操作回调验证操作者身份 (cb.from.id === ADMIN_ID)
+ * ✅ 封禁列表防止被拒用户重复申请
+ * ✅ 用户输入 HTML 转义防注入
+ * ✅ 管理员不可被踢出/封禁
+ * ✅ 用户 ID 统一为 number 类型，避免类型混淆
  *
  * Telegram Bot API 功能清单：
  * ✅ setMessageReaction — 收到视频 👀，完成 ✅
@@ -48,7 +69,8 @@ export default {
 
     // ── 健康检查 ──
     if (url.pathname === "/") {
-      return new Response("TinyAV1Bot ✅", { status: 200 });
+      const warning = env.ADMIN_ID ? "" : " ⚠️ ADMIN_ID not set";
+      return new Response(`TinyAV1Bot ✅${warning}`, { status: 200 });
     }
 
     // ── Webhook 入口 ──
@@ -66,9 +88,9 @@ export default {
         if (!msg) return ok();
 
         const chatId = msg.chat.id;
+        const userId = msg.from?.id || chatId;
         const messageId = msg.message_id;
         const text = msg.text || "";
-        const isGroup = msg.chat.type !== "private";
 
         // ── /start ──
         if (text === "/start" || text === "/start@TinyAV1Bot") {
@@ -91,6 +113,16 @@ export default {
               parse_mode: "Markdown",
             }
           );
+          return ok();
+        }
+
+        // ── /admin (仅管理员) ──
+        if (text === "/admin" || text === "/admin@TinyAV1Bot") {
+          if (!isAdmin(env, userId)) {
+            await sendText(env, chatId, messageId, "⛔ 无权限");
+            return ok();
+          }
+          await showAdminPanel(env, chatId, messageId);
           return ok();
         }
 
@@ -139,6 +171,8 @@ export default {
             statusText += "🟢 无错误\n";
           }
           statusText += `📨 待处理: ${wh.pending_update_count}\n`;
+          const wl = await getWhitelist(env);
+          statusText += `👥 白名单: ${wl.length} 人\n`;
           const me = await getMe(env);
           statusText += `🤖 Bot: @${me.username}`;
           await sendText(env, chatId, messageId, statusText, { parse_mode: "Markdown" });
@@ -173,6 +207,25 @@ export default {
 
         // ── 非视频处理 ──
         if (!msg.video && !msg.document && !msg.photo) {
+          // 纯文字消息：检查是否在申请流程中
+          if (!isAdmin(env, userId)) {
+            if (await isBanned(env, userId)) return ok(); // 封禁用户静默忽略
+
+            const app = await getApplication(env, userId);
+            if (app) {
+              if (app.text) {
+                // 已提交申请，防止重复提交
+                await sendText(env, chatId, messageId, "⏳ 申请审核中，请耐心等待。");
+                return ok();
+              }
+              // 保存申请文字（不主动通知管理员，管理员需 /admin 查看）
+              app.text = text;
+              app.time = Date.now();
+              await saveApplication(env, userId, app);
+              await sendText(env, chatId, messageId, "✅ 申请已提交！请耐心等待审批。\n\n⚠️ 申请只能提交一次，请勿重复发送。");
+              return ok();
+            }
+          }
           await sendText(env, chatId, messageId,
             "🎬 请发送视频文件\n\n💡 输入 / 查看可用命令");
           return ok();
@@ -181,6 +234,29 @@ export default {
         if (msg.document && !msg.document.mime_type?.startsWith("video/")) {
           await sendText(env, chatId, messageId, "⚠️ 请发送视频文件");
           return ok();
+        }
+
+        // ── 权限检查（媒体消息） ──
+        if (!isAdmin(env, userId)) {
+          if (await isBanned(env, userId)) {
+            await setMessageReaction(env, chatId, messageId, "🚫");
+            await sendText(env, chatId, messageId, "⛔ 你已被封禁，无法使用此 Bot。");
+            return ok();
+          }
+          if (!(await isWhitelisted(env, userId))) {
+            // 不在白名单 → 引导申请
+            await setMessageReaction(env, chatId, messageId, "🔒");
+            await saveApplication(env, userId, {
+              name: msg.from?.first_name || "未知",
+              username: msg.from?.username || "",
+              text: "",
+              time: Date.now(),
+              chatId: chatId,
+            });
+            await sendText(env, chatId, messageId,
+              "🔒 你还没有使用权限\n\n请发一段文字说明你的用途，管理员审批后即可使用。\n\n⚠️ 申请只能提交一次，请认真填写。");
+            return ok();
+          }
         }
 
         // ── 媒体消息 ──
@@ -262,7 +338,399 @@ export default {
 };
 
 
-// ── 转发来源提取 ──
+// ═══════════════════════════════════════════════════════════════
+// 权限系统
+// ═══════════════════════════════════════════════════════════════
+
+function isAdmin(env, userId) {
+  return !!(env.ADMIN_ID && String(userId) === String(env.ADMIN_ID));
+}
+
+// ── 白名单 ──
+
+async function getWhitelist(env) {
+  const raw = await env.SETTINGS?.get("whitelist");
+  if (raw) {
+    try { return JSON.parse(raw).map(Number).filter(n => !isNaN(n)); } catch {}
+  }
+  // 初始化：管理员自动入白名单
+  const adminId = Number(env.ADMIN_ID);
+  return isNaN(adminId) ? [] : [adminId];
+}
+
+async function isWhitelisted(env, userId) {
+  const wl = await getWhitelist(env);
+  return wl.some(id => id === Number(userId));
+}
+
+async function addToWhitelist(env, userId) {
+  const wl = await getWhitelist(env);
+  const id = Number(userId);
+  if (!wl.includes(id)) {
+    wl.push(id);
+    await env.SETTINGS?.put("whitelist", JSON.stringify(wl));
+  }
+}
+
+async function removeFromWhitelist(env, userId) {
+  if (isAdmin(env, userId)) return; // 管理员不可移除
+  const wl = await getWhitelist(env);
+  const id = Number(userId);
+  await env.SETTINGS?.put("whitelist", JSON.stringify(wl.filter(x => x !== id)));
+}
+
+// ── 封禁列表 ──
+
+async function getBannedList(env) {
+  const raw = await env.SETTINGS?.get("banned");
+  if (raw) {
+    try { return JSON.parse(raw).map(Number).filter(n => !isNaN(n)); } catch {}
+  }
+  return [];
+}
+
+async function isBanned(env, userId) {
+  const banned = await getBannedList(env);
+  return banned.some(id => id === Number(userId));
+}
+
+async function banUser(env, userId) {
+  if (isAdmin(env, userId)) return; // 管理员不可封禁
+  const banned = await getBannedList(env);
+  const id = Number(userId);
+  if (!banned.includes(id)) {
+    banned.push(id);
+    await env.SETTINGS?.put("banned", JSON.stringify(banned));
+  }
+  // 同时从白名单移除
+  await removeFromWhitelist(env, userId);
+}
+
+async function unbanUser(env, userId) {
+  const banned = await getBannedList(env);
+  const id = Number(userId);
+  await env.SETTINGS?.put("banned", JSON.stringify(banned.filter(x => x !== id)));
+}
+
+// ── 申请管理 ──
+
+async function getApplication(env, userId) {
+  const raw = await env.SETTINGS?.get(`app:${userId}`);
+  if (raw) {
+    try { return JSON.parse(raw); } catch {}
+  }
+  return null;
+}
+
+async function saveApplication(env, userId, data) {
+  await env.SETTINGS?.put(`app:${userId}`, JSON.stringify(data));
+}
+
+async function deleteApplication(env, userId) {
+  await env.SETTINGS?.delete(`app:${userId}`);
+}
+
+async function getPendingApplications(env) {
+  const list = await env.SETTINGS?.list({ prefix: "app:" });
+  if (!list) return [];
+  const apps = [];
+  for (const key of list.keys) {
+    const uid = parseInt(key.name.slice(4));
+    if (isNaN(uid)) continue;
+    try {
+      const data = JSON.parse(await env.SETTINGS.get(key.name) || "{}");
+      if (data.text) apps.push({ id: uid, ...data });
+    } catch {}
+  }
+  return apps;
+}
+
+// ── 管理面板 ──
+
+async function buildAdminPanelData(env) {
+  const wl = await getWhitelist(env);
+  const banned = await getBannedList(env);
+  const apps = await getPendingApplications(env);
+
+  let text = "🔧 <b>管理面板</b>\n\n";
+  text += `👥 白名单: ${wl.length} 人\n`;
+  text += `📋 待审批: ${apps.length} 个\n`;
+  text += `🚫 封禁: ${banned.length} 人`;
+
+  const kb = [];
+  if (apps.length > 0) {
+    kb.push([{ text: `📋 待审批 (${apps.length})`, callback_data: "admin:apps" }]);
+  }
+  kb.push([{ text: "👥 白名单", callback_data: "admin:wl" }]);
+  if (banned.length > 0) {
+    kb.push([{ text: `🚫 封禁列表 (${banned.length})`, callback_data: "admin:ban" }]);
+  }
+  kb.push([{ text: "🔄 刷新", callback_data: "admin:menu" }]);
+
+  return { text, kb };
+}
+
+async function showAdminPanel(env, chatId, messageId) {
+  const { text, kb } = await buildAdminPanelData(env);
+  await sendText(env, chatId, messageId, text, {
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: true },
+    reply_markup: { inline_keyboard: kb },
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 回调处理
+// ═══════════════════════════════════════════════════════════════
+
+async function handleCallback(env, cb) {
+  const chatId = cb.message?.chat?.id;
+  const messageId = cb.message?.message_id;
+  const userId = cb.from?.id;
+  if (!chatId) return;
+
+  const data = cb.data || "";
+
+  // ── 管理回调鉴权：所有 admin: / approve: / reject: / ban: / kick: / unban: 回调仅限管理员 ──
+  const adminOps = ["admin:", "approve:", "reject:", "ban:", "kick:", "unban:"];
+  if (adminOps.some(prefix => data.startsWith(prefix))) {
+    if (!isAdmin(env, userId)) {
+      await answerCallbackQuery(env, cb.id, "⛔ 无权限");
+      return;
+    }
+  }
+
+  // 命令快捷按钮
+  if (data.startsWith("cmd:")) {
+    const cmd = data.slice(4);
+    if (cmd === "help") {
+      await sendText(env, chatId, messageId, "📖 发送视频给我，压缩后发回。⏱ 5-10 分钟。📦 最大 2GB。");
+    } else if (cmd === "settings") {
+      await sendSettings(env, chatId, messageId);
+    } else if (cmd === "about") {
+      await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: "🎬 TinyAV1Bot — 免费视频压缩",
+          reply_markup: { inline_keyboard: [[
+            { text: "🐙 GitHub", url: "https://github.com/Juwan-Hwang/av1-compression-notes" },
+          ]] },
+        }),
+      });
+    } else if (cmd === "status") {
+      const wh = await getWebhookInfo(env);
+      const wl = await getWhitelist(env);
+      await sendText(env, chatId, messageId,
+        `✅ Bot 在线\n📡 Webhook: ${wh.url ? "正常" : "未设置"}\n📨 待处理: ${wh.pending_update_count}\n👥 白名单: ${wl.length} 人`);
+    }
+    await answerCallbackQuery(env, cb.id, "");
+    return;
+  }
+
+  // ── 管理面板导航 ──
+
+  if (data === "admin:menu") {
+    const { text, kb } = await buildAdminPanelData(env);
+    await editMessageText(env, chatId, messageId, text, {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: { inline_keyboard: kb },
+    });
+    await answerCallbackQuery(env, cb.id, "");
+    return;
+  }
+
+  if (data === "admin:apps") {
+    const apps = await getPendingApplications(env);
+    let text;
+    const kb = [];
+
+    if (apps.length === 0) {
+      text = "📋 没有待审批的申请。";
+    } else {
+      text = `📋 <b>待审批</b> (${apps.length} 个)\n`;
+      for (const a of apps.slice(0, 8)) {
+        text += `\n👤 ${escapeHtml(a.name)} — <code>${a.id}</code>\n`;
+        if (a.username) text += `📌 @${escapeHtml(a.username)}\n`;
+        const preview = a.text.length > 100 ? a.text.slice(0, 100) + "..." : a.text;
+        text += `💬 ${escapeHtml(preview)}\n`;
+        kb.push([
+          { text: `✅ ${a.id}`, callback_data: `approve:${a.id}` },
+          { text: `❌ ${a.id}`, callback_data: `reject:${a.id}` },
+          { text: `🚫 ${a.id}`, callback_data: `ban:${a.id}` },
+        ]);
+      }
+      if (apps.length > 8) {
+        text += `\n...还有 ${apps.length - 8} 个申请未显示`;
+      }
+    }
+    kb.push([{ text: "← 返回", callback_data: "admin:menu" }]);
+
+    await editMessageText(env, chatId, messageId, text, {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: { inline_keyboard: kb },
+    });
+    await answerCallbackQuery(env, cb.id, "");
+    return;
+  }
+
+  if (data === "admin:wl") {
+    const wl = await getWhitelist(env);
+    let text = `👥 <b>白名单</b> (${wl.length})\n`;
+    const kb = [];
+    for (const id of wl) {
+      if (isAdmin(env, id)) {
+        text += `\n👑 ${id} (管理员)`;
+      } else {
+        text += `\n• ${id}`;
+        kb.push([
+          { text: `踢出 ${id}`, callback_data: `kick:${id}` },
+          { text: "🚫 封禁", callback_data: `ban:${id}` },
+        ]);
+      }
+    }
+    kb.push([{ text: "← 返回", callback_data: "admin:menu" }]);
+    await editMessageText(env, chatId, messageId, text, {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: { inline_keyboard: kb },
+    });
+    await answerCallbackQuery(env, cb.id, "");
+    return;
+  }
+
+  if (data === "admin:ban") {
+    const banned = await getBannedList(env);
+    let text = `🚫 <b>封禁列表</b> (${banned.length})\n`;
+    const kb = [];
+    if (banned.length === 0) {
+      text += "\n暂无封禁用户。";
+    } else {
+      for (const id of banned) {
+        text += `\n• ${id}`;
+        kb.push([{ text: `解封 ${id}`, callback_data: `unban:${id}` }]);
+      }
+    }
+    kb.push([{ text: "← 返回", callback_data: "admin:menu" }]);
+    await editMessageText(env, chatId, messageId, text, {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: { inline_keyboard: kb },
+    });
+    await answerCallbackQuery(env, cb.id, "");
+    return;
+  }
+
+  // ── 批准申请 ──
+
+  if (data.startsWith("approve:")) {
+    const targetId = Number(data.slice(8));
+    await addToWhitelist(env, targetId);
+    await deleteApplication(env, targetId);
+    await answerCallbackQuery(env, cb.id, "✅ 已批准");
+    // 通知用户
+    await sendText(env, targetId, null, "🎉 你的申请已通过！现在可以发视频给我了。");
+    // 更新管理消息
+    const wl = await getWhitelist(env);
+    await editMessageText(env, chatId, messageId,
+      `✅ 已批准 <code>${targetId}</code>\n\n👥 白名单: ${wl.length} 人`,
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+    return;
+  }
+
+  // ── 拒绝申请 ──
+
+  if (data.startsWith("reject:")) {
+    const targetId = Number(data.slice(7));
+    await deleteApplication(env, targetId);
+    await answerCallbackQuery(env, cb.id, "❌ 已拒绝");
+    await sendText(env, targetId, null, "❌ 你的申请未被通过。你可以重新申请。");
+    await editMessageText(env, chatId, messageId,
+      `❌ 已拒绝 <code>${targetId}</code>`,
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+    return;
+  }
+
+  // ── 封禁用户 ──
+
+  if (data.startsWith("ban:")) {
+    const targetId = Number(data.slice(4));
+    await banUser(env, targetId);
+    await deleteApplication(env, targetId);
+    await answerCallbackQuery(env, cb.id, "🚫 已封禁");
+    await sendText(env, targetId, null, "⛔ 你已被封禁。");
+    await editMessageText(env, chatId, messageId,
+      `🚫 已封禁 <code>${targetId}</code>`,
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+    return;
+  }
+
+  // ── 踢出用户 ──
+
+  if (data.startsWith("kick:")) {
+    const targetId = Number(data.slice(5));
+    await removeFromWhitelist(env, targetId);
+    await answerCallbackQuery(env, cb.id, "⛔ 已踢出");
+    await sendText(env, targetId, null, "⛔ 你已被移出白名单。");
+    await editMessageText(env, chatId, messageId,
+      `⛔ 已踢出 <code>${targetId}</code>`,
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+    return;
+  }
+
+  // ── 解封用户 ──
+
+  if (data.startsWith("unban:")) {
+    const targetId = Number(data.slice(6));
+    await unbanUser(env, targetId);
+    await answerCallbackQuery(env, cb.id, "✅ 已解封");
+    await editMessageText(env, chatId, messageId,
+      `✅ 已解封 <code>${targetId}</code>`,
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+    return;
+  }
+
+  // 设置开关
+  if (data.startsWith("toggle:")) {
+    const key = data.slice(7);
+    const s = await getSettings(env, chatId);
+    if (key in s) {
+      s[key] = !s[key];
+      await saveSettings(env, chatId, s);
+    }
+
+    // 更新消息文本+按钮
+    let text = "⚙️ *设置*\n\n默认：只返回裸视频\n点击按钮开关：\n";
+    for (const [k, info] of Object.entries(SETTING_KEYS)) {
+      text += `\n${s[k] ? "✅" : "❌"} ${info.label} — ${info.desc}`;
+    }
+    await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/editMessageText`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        text,
+        parse_mode: "Markdown",
+        reply_markup: { inline_keyboard: buildSettingsKeyboard(s) },
+        link_preview_options: { is_disabled: true },
+      }),
+    });
+
+    // toast 提示
+    const label = SETTING_KEYS[key]?.label || key;
+    await answerCallbackQuery(env, cb.id, `${s[key] ? "✅ 已开启" : "❌ 已关闭"}: ${label}`);
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// 转发来源提取
+// ═══════════════════════════════════════════════════════════════
+
 function extractForwardName(msg) {
   const origin = msg.forward_origin || msg.forward_from;
   if (!origin) return null;
@@ -284,7 +752,10 @@ function extractForwardName(msg) {
 }
 
 
-// ── GitHub Actions 触发 ──
+// ═══════════════════════════════════════════════════════════════
+// GitHub Actions 触发
+// ═══════════════════════════════════════════════════════════════
+
 async function triggerWorkflow(env, chatId, messageId, caption, genThumb) {
   return await fetch(
     `https://api.github.com/repos/${env.GH_REPO}/actions/workflows/${env.GH_WORKFLOW}/dispatches`,
@@ -309,7 +780,10 @@ async function triggerWorkflow(env, chatId, messageId, caption, genThumb) {
 }
 
 
-// ── 设置 ──
+// ═══════════════════════════════════════════════════════════════
+// 设置系统
+// ═══════════════════════════════════════════════════════════════
+
 const DEFAULT_SETTINGS = {
   keep_caption: false,
   forward_photos: false,
@@ -364,80 +838,30 @@ async function sendSettings(env, chatId, messageId) {
   });
 }
 
-async function handleCallback(env, cb) {
-  const chatId = cb.message?.chat?.id;
-  const messageId = cb.message?.message_id;
-  if (!chatId) return;
 
-  // 命令快捷按钮
-  if (cb.data?.startsWith("cmd:")) {
-    const cmd = cb.data.slice(4);
-    if (cmd === "help") {
-      await sendText(env, chatId, messageId, "📖 发送视频给我，压缩后发回。⏱ 5-10 分钟。📦 最大 2GB。");
-    } else if (cmd === "settings") {
-      await sendSettings(env, chatId, messageId);
-    } else if (cmd === "about") {
-      await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: "🎬 TinyAV1Bot — 免费视频压缩",
-          reply_markup: { inline_keyboard: [[
-            { text: "🐙 GitHub", url: "https://github.com/Juwan-Hwang/av1-compression-notes" },
-          ]] },
-        }),
-      });
-    } else if (cmd === "status") {
-      const wh = await getWebhookInfo(env);
-      await sendText(env, chatId, messageId,
-        `✅ Bot 在线\n📡 Webhook: ${wh.url ? "正常" : "未设置"}\n📨 待处理: ${wh.pending_update_count}`);
-    }
-    await answerCallbackQuery(env, cb.id, "");
-    return;
-  }
+// ═══════════════════════════════════════════════════════════════
+// 工具函数
+// ═══════════════════════════════════════════════════════════════
 
-  // 设置开关
-  if (cb.data?.startsWith("toggle:")) {
-    const key = cb.data.slice(7);
-    const s = await getSettings(env, chatId);
-    if (key in s) {
-      s[key] = !s[key];
-      await saveSettings(env, chatId, s);
-    }
-
-    // 更新消息文本+按钮
-    let text = "⚙️ *设置*\n\n默认：只返回裸视频\n点击按钮开关：\n";
-    for (const [k, info] of Object.entries(SETTING_KEYS)) {
-      text += `\n${s[k] ? "✅" : "❌"} ${info.label} — ${info.desc}`;
-    }
-    await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/editMessageText`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        message_id: messageId,
-        text,
-        parse_mode: "Markdown",
-        reply_markup: { inline_keyboard: buildSettingsKeyboard(s) },
-        link_preview_options: { is_disabled: true },
-      }),
-    });
-
-    // toast 提示
-    const label = SETTING_KEYS[key]?.label || key;
-    await answerCallbackQuery(env, cb.id, `${s[key] ? "✅ 已开启" : "❌ 已关闭"}: ${label}`);
-  }
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 
-// ── Bot API 封装 ──
+// ═══════════════════════════════════════════════════════════════
+// Bot API 封装
+// ═══════════════════════════════════════════════════════════════
+
 function ok() { return new Response("OK", { status: 200 }); }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function sendText(env, chatId, replyTo, text, extra = {}) {
-  const body = { chat_id: chatId, text, reply_to_message_id: replyTo, ...extra };
+  const body = { chat_id: chatId, text, ...extra };
+  if (replyTo) body.reply_to_message_id = replyTo;
   const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
