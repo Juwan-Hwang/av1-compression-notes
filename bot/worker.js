@@ -268,7 +268,16 @@ export default {
 
         // 只有图片没视频
         if (!video && photos) {
-          if (settings.forward_photos || settings.source_format) {
+          // 媒体组：收集同组图片，批量转发（合并为一条专辑消息）
+          if (msg.media_group_id) {
+            if (settings.forward_photos) {
+              await collectAndForwardMediaGroup(env, chatId, messageId, msg.media_group_id, settings);
+            }
+            // 媒体组里的图片静默处理（组里有视频会单独处理）
+            return ok();
+          }
+          // 独立图片
+          if (settings.forward_photos) {
             await copyMessage(env, chatId, messageId);
           } else {
             await sendText(env, chatId, messageId, "ℹ️ 只收到图片，请发送视频才会压缩");
@@ -291,44 +300,39 @@ export default {
           return ok();
         }
 
-        // source_format 或 forward_photos：转发原始消息
-        if (settings.source_format) {
-          await copyMessage(env, chatId, messageId);
-        } else if (photos && settings.forward_photos) {
-          await copyMessage(env, chatId, messageId);
-        }
-
         // 构造 caption
+        // source_format: 压缩后以源格式返回（保留原始 caption）
+        // keep_caption: 保留 #标签等文字
         let finalCaption = "";
-        if (settings.keep_caption && caption) {
+        if ((settings.keep_caption || settings.source_format) && caption) {
           finalCaption = caption;
         }
         if (settings.forward_source && forwardName) {
           finalCaption += (finalCaption ? "\n" : "") + `#${forwardName}`;
         }
 
-        // 发送状态消息（后续会被 GA 更新/删除）
-        const statusMsg = await sendText(env, chatId, messageId, "🚀 收到！正在压缩...\n⏱ 预计 5-10 分钟");
-
-        // sendChatAction 心跳：每 5 秒发一次 upload_video（最多 4 分钟）
-        // Worker 有 CPU 时间限制，不能一直跑，发几次就够了
-        for (let i = 0; i < 3; i++) {
-          await sendChatAction(env, chatId, "upload_video");
-          if (i < 2) await sleep(4000);
-        }
-
-        // 触发 GA workflow
+        // 先触发 GA workflow，成功后才告诉用户「正在压缩」
         const resp = await triggerWorkflow(env, chatId, messageId, finalCaption, settings.gen_thumbnail);
 
         if (!resp.ok) {
+          // 触发失败：读取 GitHub 返回的错误信息
+          let errDetail = `HTTP ${resp.status}`;
+          try { const ej = await resp.json(); if (ej.message) errDetail = ej.message; } catch {}
           await setMessageReaction(env, chatId, messageId, "❌");
-          if (statusMsg) {
-            await editMessageText(env, chatId, statusMsg.message_id, "❌ 排队失败，请稍后重试。");
-          }
+          await sendText(env, chatId, messageId, `❌ 排队失败：${errDetail}\n请稍后重试。`);
+          return ok();
         }
+
+        // 触发成功：发送状态消息（GA 中的 prepare.py 会编辑/删除它）
+        await setMessageReaction(env, chatId, messageId, "🚀");
+        await sendText(env, chatId, messageId, "🚀 已加入压缩队列！\n⏱ 预计 5-10 分钟\n\n💡 压缩在 GitHub Actions 上运行，完成后自动发回。");
 
         return ok();
       } catch (e) {
+        // 错误不再静默吞掉
+        try {
+          await sendText(env, chatId, messageId || 0, `⚠️ 内部错误：${e.message || e}`);
+        } catch {}
         return ok();
       }
     }
@@ -884,6 +888,51 @@ async function copyMessage(env, chatId, messageId) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, from_chat_id: chatId, message_id: messageId }),
   });
+}
+
+async function copyMessages(env, chatId, messageIds) {
+  return await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/copyMessages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, from_chat_id: chatId, message_ids: messageIds }),
+  });
+}
+
+// ── 媒体组收集转发 ──
+// Telegram 媒体组的每条消息独立到达 webhook，用 KV 收集后批量 copyMessages
+// 只有 message_id 最小的请求执行转发，避免重复
+async function collectAndForwardMediaGroup(env, chatId, messageId, groupId, settings) {
+  const mgKey = `mg:${chatId}:${groupId}`;
+
+  // 追加当前消息 ID
+  let ids = [];
+  const raw = await env.SETTINGS?.get(mgKey);
+  if (raw && raw !== "done") {
+    try { ids = JSON.parse(raw); } catch {}
+  }
+  if (raw === "done") return; // 已处理
+
+  ids.push(messageId);
+  await env.SETTINGS?.put(mgKey, JSON.stringify(ids), { expirationTtl: 120 });
+
+  // 等待同组其他消息到达
+  await sleep(600);
+
+  // 重新读取全部 ID
+  const updated = await env.SETTINGS?.get(mgKey);
+  if (updated === "done") return;
+  if (updated) {
+    try { ids = JSON.parse(updated); } catch {}
+  }
+
+  // 只有 message_id 最小的请求执行转发，防止重复
+  if (Math.min(...ids) !== messageId) return;
+
+  // 标记完成
+  await env.SETTINGS?.put(mgKey, "done", { expirationTtl: 120 });
+
+  // 批量转发（Telegram 自动合并为专辑消息）
+  await copyMessages(env, chatId, ids);
 }
 
 async function setMessageReaction(env, chatId, messageId, emoji) {
