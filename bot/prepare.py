@@ -14,7 +14,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-MAX_SEG = 40      # 切最多 40 段，打满账号级并发上限
+MAX_SEG = 35      # 切最多 35 段，留 5 个 runner 给 finalize + 下个视频的 prepare
 MIN_SEG_SEC = 5    # 每段最少 5 秒，短于此则减少段数
 
 
