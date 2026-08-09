@@ -1,14 +1,13 @@
 # .github/workflows/compress.yml
-# AV1 视频压缩 — 三阶段并行架构
-# prepare(切分) → compress(并行编码) → finalize(合并+上传)
+# AV1 视频压缩 — Phase 1: 下载 + 切分
+# 无并发限制：prepare 自由并行，结束后触发 encode.yml
 #
 # 隐私保护：
-# - workflow inputs 不含文件名，只传 chat_id/message_id
-# - 所有日志不输出文件名/大小/时长
+# - 敏感参数通过 env 传递，不出现在命令行/日志
 # - artifact 自动清理 (retention-days: 1)
 # - 编码后清除元数据 (-map_metadata -1)
 # - 所有中间文件在 /tmp，runner 销毁后自动清除
-name: AV1 Video Compression
+name: AV1 Prepare
 
 on:
   workflow_dispatch:
@@ -32,11 +31,7 @@ permissions:
   contents: read
   actions: write
 
-# 不串行化：prepare 自由并行，35 段保证 finalize 永远有空闲 runner
-# 35 compress + 1 finalize = 36 < 40，finalize 零排队
-
 jobs:
-  # ── Phase 1: 下载 + 切分 ───────────────────────────
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -82,110 +77,30 @@ jobs:
           path: segments.json
           retention-days: 1
 
-      - name: Cleanup workspace
-        run: rm -rf segments segments.json
-
-  # ── Phase 2: 并行编码 ──────────────────────────────
-  compress:
-    needs: prepare
-    strategy:
-      matrix:
-        segment: ${{ fromJSON(needs.prepare.outputs.segments) }}
-      max-parallel: 40
-      fail-fast: false
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install ffmpeg
-        run: |
-          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | tar xJ -C /tmp
-          echo "/tmp/ffmpeg-master-latest-linux64-gpl/bin" >> $GITHUB_PATH
-
-      - name: Download segments
-        uses: actions/download-artifact@v4
-        with:
-          name: segments
-
-      - name: Encode
-        run: |
-          SEG_FILE=$(printf "seg_%03d.mp4" ${{ matrix.segment }})
-          OUT_FILE=$(printf "seg_%03d_enc.mp4" ${{ matrix.segment }})
-
-          ffmpeg -y -i "$SEG_FILE" \
-            -c:v libsvtav1 -preset 2 -crf 36 -pix_fmt yuv420p \
-            -vf "scale=1280:720,setsar=1" \
-            -c:a libopus -b:a 96k \
-            -map_metadata -1 \
-            "$OUT_FILE"
-
-          # 清除原始分片
-          rm -f "$SEG_FILE"
-
-      - name: Upload encoded segment
-        uses: actions/upload-artifact@v4
-        with:
-          name: encoded-${{ matrix.segment }}
-          path: seg_*_enc.mp4
-          retention-days: 1
-
-  # ── Phase 3: 合并 + 上传 ───────────────────────────
-  finalize:
-    needs: [prepare, compress]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install Python deps
-        run: pip install -r bot/requirements.txt
-
-      - name: Install ffmpeg
-        run: |
-          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | tar xJ -C /tmp
-          echo "/tmp/ffmpeg-master-latest-linux64-gpl/bin" >> $GITHUB_PATH
-
-      - name: Download metadata
-        uses: actions/download-artifact@v4
-        with:
-          name: metadata
-
-      - name: Download all encoded segments
-        uses: actions/download-artifact@v4
-        with:
-          pattern: encoded-*
-          path: encoded
-          merge-multiple: true
-
-      - name: Merge & upload
+      - name: Trigger encode workflow
         env:
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          GEN_THUMBNAIL: ${{ inputs.gen_thumbnail }}
           CHAT_ID: ${{ inputs.chat_id }}
           MESSAGE_ID: ${{ inputs.message_id }}
           CAPTION: ${{ inputs.caption }}
-        run: python bot/finalize.py
-
-      - name: Delete artifacts (current run only)
-        if: always()
+          GEN_THUMBNAIL: ${{ inputs.gen_thumbnail }}
+          SEGMENTS: ${{ steps.split.outputs.segments }}
+          COUNT: ${{ steps.split.outputs.count }}
         uses: actions/github-script@v7
         with:
           script: |
-            const artifacts = await github.rest.actions.listArtifactsForRepo({
+            const r = await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              run_id: context.runId,
-              per_page: 100
+              workflow_id: 'encode.yml',
+              ref: 'main',
+              inputs: {
+                chat_id: process.env.CHAT_ID,
+                message_id: process.env.MESSAGE_ID,
+                caption: process.env.CAPTION,
+                gen_thumbnail: process.env.GEN_THUMBNAIL,
+                prepare_run_id: String(context.runId),
+                segments: process.env.SEGMENTS,
+                count: process.env.COUNT
+              }
             });
-            for (const artifact of artifacts.data.artifacts) {
-              await github.rest.actions.deleteArtifact({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                artifact_id: artifact.id
-              });
-              core.info(`Deleted artifact: ${artifact.name}`);
-            }
+            core.info(`Triggered encode.yml (prepare run ${context.runId})`);

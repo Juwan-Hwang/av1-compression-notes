@@ -1,0 +1,159 @@
+# .github/workflows/encode.yml
+# AV1 视频压缩 — Phase 2+3: 并行编码 + 合并上传
+# 串行化：同一时刻只有一个视频在编码，finalize 零排队
+# prepare 的 artifacts 通过 run-id 跨工作流下载
+name: AV1 Encode
+
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: "Telegram chat ID"
+        required: true
+      message_id:
+        description: "Telegram message ID"
+        required: true
+      caption:
+        description: "Original caption"
+        required: false
+        default: ""
+      gen_thumbnail:
+        description: "Generate thumbnail (1/0)"
+        required: false
+        default: "0"
+      prepare_run_id:
+        description: "Run ID of the prepare workflow (for artifact download)"
+        required: true
+      segments:
+        description: "JSON array of segment indices"
+        required: true
+      count:
+        description: "Number of segments"
+        required: true
+
+permissions:
+  contents: read
+  actions: write
+
+# 串行化：一个视频的 compress+finalize 完成后，下一个才开始
+# 这样 finalize 永远不用跟别的视频的 compress 抢 runner
+concurrency:
+  group: av1-encode
+  cancel-in-progress: false
+
+jobs:
+  # ── Phase 2: 并行编码 ──────────────────────────────
+  compress:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        segment: ${{ fromJSON(inputs.segments) }}
+      max-parallel: 40
+      fail-fast: false
+    steps:
+      - name: Install ffmpeg
+        run: |
+          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | tar xJ -C /tmp
+          echo "/tmp/ffmpeg-master-latest-linux64-gpl/bin" >> $GITHUB_PATH
+
+      - name: Download segments (from prepare run)
+        uses: actions/download-artifact@v4
+        with:
+          name: segments
+          run-id: ${{ inputs.prepare_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Encode
+        run: |
+          SEG_FILE=$(printf "seg_%03d.mp4" ${{ matrix.segment }})
+          OUT_FILE=$(printf "seg_%03d_enc.mp4" ${{ matrix.segment }})
+
+          ffmpeg -y -i "$SEG_FILE" \
+            -c:v libsvtav1 -preset 2 -crf 36 -pix_fmt yuv420p \
+            -vf "scale=1280:720,setsar=1" \
+            -c:a libopus -b:a 96k \
+            -map_metadata -1 \
+            "$OUT_FILE"
+
+          rm -f "$SEG_FILE"
+
+      - name: Upload encoded segment
+        uses: actions/upload-artifact@v4
+        with:
+          name: encoded-${{ matrix.segment }}
+          path: seg_*_enc.mp4
+          retention-days: 1
+
+  # ── Phase 3: 合并 + 上传 ───────────────────────────
+  finalize:
+    needs: compress
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python deps
+        run: pip install -r bot/requirements.txt
+
+      - name: Install ffmpeg
+        run: |
+          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | tar xJ -C /tmp
+          echo "/tmp/ffmpeg-master-latest-linux64-gpl/bin" >> $GITHUB_PATH
+
+      - name: Download metadata (from prepare run)
+        uses: actions/download-artifact@v4
+        with:
+          name: metadata
+          run-id: ${{ inputs.prepare_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all encoded segments (from current run)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: encoded-*
+          path: encoded
+          merge-multiple: true
+
+      - name: Merge & upload
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GEN_THUMBNAIL: ${{ inputs.gen_thumbnail }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          MESSAGE_ID: ${{ inputs.message_id }}
+          CAPTION: ${{ inputs.caption }}
+        run: python bot/finalize.py
+
+      - name: Delete artifacts (current run + prepare run)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+
+            // 1. Delete current run's artifacts (encoded-*)
+            const cur = await github.rest.actions.listArtifactsForRepo({
+              owner, repo, run_id: context.runId, per_page: 100
+            });
+            for (const a of cur.data.artifacts) {
+              await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: a.id });
+              core.info(`Deleted encode artifact: ${a.name}`);
+            }
+
+            // 2. Delete prepare run's artifacts (segments + metadata)
+            const prepareRunId = '${{ inputs.prepare_run_id }}';
+            if (prepareRunId) {
+              const prev = await github.rest.actions.listArtifactsForRepo({
+                owner, repo, run_id: prepareRunId, per_page: 100
+              });
+              for (const a of prev.data.artifacts) {
+                await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: a.id });
+                core.info(`Deleted prepare artifact: ${a.name}`);
+              }
+            }
