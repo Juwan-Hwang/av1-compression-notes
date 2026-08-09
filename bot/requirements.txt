@@ -1,0 +1,4 @@
+# AV1 视频压缩 Bot -- Python 依赖
+# Pyrogram: MTProto 客户端，支持 2GB 文件下载/上传
+pyrogram>=2.0.106
+tgcrypto>=1.2.5
