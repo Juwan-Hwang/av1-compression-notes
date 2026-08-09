@@ -1,0 +1,97 @@
+# .github/workflows/finalize.yml
+# AV1 视频压缩 — Phase 3: 合并 + 上传
+# 无并发限制：finalize 自由并行
+# 可以跟下一个视频的 compress 同时跑（1+35=36 < 40）
+name: AV1 Finalize
+
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: "Telegram chat ID"
+        required: true
+      message_id:
+        description: "Telegram message ID"
+        required: true
+      caption:
+        description: "Original caption"
+        required: false
+        default: ""
+      gen_thumbnail:
+        description: "Generate thumbnail (1/0)"
+        required: false
+        default: "0"
+      prepare_run_id:
+        description: "Run ID of prepare workflow (for metadata)"
+        required: true
+      encode_run_id:
+        description: "Run ID of encode workflow (for encoded segments)"
+        required: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python deps
+        run: pip install -r bot/requirements.txt
+
+      - name: Install ffmpeg
+        run: |
+          curl -sL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | tar xJ -C /tmp
+          echo "/tmp/ffmpeg-master-latest-linux64-gpl/bin" >> $GITHUB_PATH
+
+      - name: Download metadata (from prepare run)
+        uses: actions/download-artifact@v4
+        with:
+          name: metadata
+          run-id: ${{ inputs.prepare_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download encoded segments (from encode run)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: encoded-*
+          path: encoded
+          merge-multiple: true
+          run-id: ${{ inputs.encode_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge & upload
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GEN_THUMBNAIL: ${{ inputs.gen_thumbnail }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          MESSAGE_ID: ${{ inputs.message_id }}
+          CAPTION: ${{ inputs.caption }}
+        run: python bot/finalize.py
+
+      - name: Delete all artifacts (prepare + encode runs)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+
+            for (const runId of ['${{ inputs.prepare_run_id }}', '${{ inputs.encode_run_id }}']) {
+              const resp = await github.rest.actions.listArtifactsForRepo({
+                owner, repo, run_id: runId, per_page: 100
+              });
+              for (const a of resp.data.artifacts) {
+                await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: a.id });
+                core.info(`Deleted artifact from run ${runId}: ${a.name}`);
+              }
+            }

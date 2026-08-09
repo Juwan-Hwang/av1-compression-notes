@@ -1,12 +1,6 @@
 # .github/workflows/compress.yml
 # AV1 视频压缩 — Phase 1: 下载 + 切分
 # 无并发限制：prepare 自由并行，结束后触发 encode.yml
-#
-# 隐私保护：
-# - 敏感参数通过 env 传递，不出现在命令行/日志
-# - artifact 自动清理 (retention-days: 1)
-# - 编码后清除元数据 (-map_metadata -1)
-# - 所有中间文件在 /tmp，runner 销毁后自动清除
 name: AV1 Prepare
 
 on:
@@ -84,7 +78,6 @@ jobs:
           CAPTION: ${{ inputs.caption }}
           GEN_THUMBNAIL: ${{ inputs.gen_thumbnail }}
           SEGMENTS: ${{ steps.split.outputs.segments }}
-          COUNT: ${{ steps.split.outputs.count }}
         uses: actions/github-script@v7
         with:
           script: |
@@ -99,8 +92,7 @@ jobs:
                 caption: process.env.CAPTION,
                 gen_thumbnail: process.env.GEN_THUMBNAIL,
                 prepare_run_id: String(context.runId),
-                segments: process.env.SEGMENTS,
-                count: process.env.COUNT
+                segments: process.env.SEGMENTS
               }
             });
             core.info(`Triggered encode.yml (prepare run ${context.runId})`);
