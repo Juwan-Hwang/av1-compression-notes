@@ -150,15 +150,26 @@ ffmpeg -i input.mp4 \
 | 来源 | opencontent.netflix.com | — |
 | 分辨率 | 4096×2160 (DCI 4K) | 1280×720 |
 | 帧率 | 59.94 fps | 59.94 fps |
-| 格式 | H.264 | AV1 (SVT-AV1) |
+| 格式 | H.264 (8-bit SDR) | AV1 (SVT-AV1) |
 | 时长 | 1850.8 s | 1850.8 s |
-| 文件大小 | 10.16 GB | 编码中... |
-| 压缩比 | — | 待测 |
+| 文件大小 | 10.16 GB | **427.75 MB** |
+| 视频码率 | ~44 Mbps | 1936 kbps |
+| 编码时间 | — | ~109 min |
+| 压缩比 | — | **24:1** |
+
+> Chimera 为 Netflix 开源 4K 测试片。经检测，源片实际为 8-bit SDR 内容（文件名含 HDR 但无 HDR 元数据标记）。编码命令同标准方案：
+
+```bash
+ffmpeg -i Chimera_4K.mp4 \
+  -c:v libsvtav1 -preset 2 -crf 36 -pix_fmt yuv420p \
+  -vf "scale=1280:720,setsar=1" \
+  -c:a libopus -b:a 96k -movflags +faststart \
+  output.mp4
+```
 
 | 指标 | 值 |
 |------|-----|
-| PSNR | 编码中... |
-| SSIM | 编码中... |
-| VMAF | 编码中... |
-
-> Chimera 为 Netflix 开源 4K HDR 测试片，包含大量实拍高动态范围场景。4K → 720p 的下采样提供了额外的压缩空间。
+| PSNR 平均 | 43.68 |
+| PSNR 最差帧 | 35.43 |
+| SSIM 综合 | 0.9799 |
+| VMAF | 95.17 |
