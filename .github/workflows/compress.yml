@@ -19,6 +19,10 @@ on:
       message_id:
         description: "Telegram message ID"
         required: true
+      caption:
+        description: "Original caption (#tags etc) to preserve"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -153,7 +157,7 @@ jobs:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-        run: python bot/finalize.py "${{ inputs.chat_id }}" "${{ inputs.message_id }}"
+        run: python bot/finalize.py "${{ inputs.chat_id }}" "${{ inputs.message_id }}" "${{ inputs.caption }}"
 
       - name: Delete all artifacts
         if: always()
