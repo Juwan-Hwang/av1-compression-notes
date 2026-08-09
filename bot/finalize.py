@@ -128,7 +128,25 @@ async def main():
                 supports_streaming=True)
 
             await status.delete()
+
+            # ── 压缩统计 ──
+            out_size = os.path.getsize(out_path)
+            orig_size = meta.get("orig_size", 0)
+            if orig_size > 0:
+                ratio = out_size / orig_size
+                stats = f"✅ 压缩完成\n\n📦 {fmt_size(orig_size)} → {fmt_size(out_size)}\n📉 压缩率: {ratio:.1%}（省了 {fmt_size(orig_size - out_size)}）"
+                await app.send_message(chat_id, stats, reply_to_message_id=message_id)
+
             log.info("Upload complete")
+
+
+def fmt_size(n):
+    """格式化文件大小"""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 
 if __name__ == "__main__":

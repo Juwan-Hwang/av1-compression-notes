@@ -14,8 +14,8 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-MAX_SEG = 40      # 切最多 40 段，最大化 GA 并发（40 runner × 2 核 = 80 核）
-MIN_SEG_SEC = 3    # 每段最少 3 秒，短于此则减少段数
+MAX_SEG = 20      # 固定切 20 段，打满 GA 并发
+MIN_SEG_SEC = 5    # 每段最少 5 秒，短于此则减少段数
 
 
 async def main():
@@ -64,6 +64,8 @@ async def main():
                 os.path.join(seg_dir, "seg_%03d.mp4")
             ], check=True, capture_output=True)
 
+            # ── 记录原始文件大小 ──
+            orig_size = os.path.getsize(inp)
             os.remove(inp)  # 删源文件
 
             # ── 拷贝到 workspace ──
@@ -82,7 +84,7 @@ async def main():
                 f.write(f"count={len(segs)}\n")
 
             with open(os.path.join(ws, "segments.json"), "w") as f:
-                json.dump({"segments": indices, "count": len(segs)}, f)
+                json.dump({"segments": indices, "count": len(segs), "orig_size": orig_size}, f)
 
             await status.edit_text(f"🚀 {len(segs)} 段并行编码中...")
             log.info(f"Ready: {len(segs)} segments")
