@@ -1,7 +1,7 @@
 # .github/workflows/encode.yml
 # AV1 视频压缩 — Phase 2: 并行编码
-# 无 concurrency：不会取消任何 run，多视频自然共享 40 runner 池
-# 35 段 + finalize 1 = 36 < 40，finalize 永远有空闲 runner
+# 轮询等待：compress 串行（FIFO），不取消任何 run
+# prepare & finalize 自由并行，不被 compress 阻塞
 name: AV1 Encode
 
 on:
@@ -33,7 +33,42 @@ permissions:
   actions: write
 
 jobs:
+  # ── 等待轮次：FIFO 排队，不取消任何 run ──
+  wait-for-slot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for older encode runs to finish
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+            while (true) {
+              const resp = await github.rest.actions.listWorkflowRuns({
+                owner, repo,
+                workflow_id: 'encode.yml',
+                status: 'in_progress',
+                per_page: 100
+              });
+
+              // 只等比自己先到的（run ID 更小），后到的不影响
+              const older = resp.data.workflow_runs.filter(r => r.id < context.runId);
+
+              if (older.length === 0) {
+                core.info('No older encode running, proceeding!');
+                break;
+              }
+
+              const ids = older.map(r => r.id).join(', ');
+              core.info(`Waiting for older encode run(s): ${ids}`);
+              await sleep(30000); // 30s 轮询
+            }
+
+  # ── Phase 2: 并行编码 ──
   compress:
+    needs: wait-for-slot
     runs-on: ubuntu-latest
     strategy:
       matrix:
